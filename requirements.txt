@@ -1,0 +1,11 @@
+# Bot API Implementation (Default - 50MB limit)
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+
+# Professional Implementation (2GB limit)
+pyrogram==2.0.106
+tgcrypto==1.2.5
+
+# Client API Implementation (Professional - uncomment if needed)
+# pyrogram==2.0.106
+# tgcrypto==1.2.5
