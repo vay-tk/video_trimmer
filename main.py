@@ -50,7 +50,8 @@ def check_ffmpeg():
         result = subprocess.run(['ffmpeg', '-version'], 
                               capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
-            return True, "FFmpeg found"
+            version_line = result.stdout.split('\n')[0]
+            return True, f"FFmpeg found: {version_line}"
         else:
             return False, "FFmpeg not working properly"
     except FileNotFoundError:
@@ -59,6 +60,15 @@ def check_ffmpeg():
         return False, "FFmpeg timeout"
     except Exception as e:
         return False, f"FFmpeg check failed: {e}"
+
+def get_deployment_info():
+    """Get deployment environment information"""
+    env_info = {
+        'platform': os.getenv('RAILWAY_ENVIRONMENT', 'local'),
+        'service': os.getenv('RAILWAY_SERVICE_NAME', 'unknown'),
+        'deployment_id': os.getenv('RAILWAY_DEPLOYMENT_ID', 'unknown')[:8]
+    }
+    return env_info
 
 async def progress_callback(current, total, message, action):
     """Show download/upload progress"""
@@ -74,29 +84,47 @@ async def start_command(client: Client, message: Message):
     """Handle /start command"""
     # Check FFmpeg availability
     ffmpeg_ok, ffmpeg_msg = check_ffmpeg()
+    deployment_info = get_deployment_info()
     
     if not ffmpeg_ok:
-        await message.reply_text(
-            f"⚠️ **FFmpeg Not Found**\n\n"
-            f"**Issue**: {ffmpeg_msg}\n\n"
-            f"**Windows Installation**:\n"
-            f"1. Download from: https://ffmpeg.org/download.html\n"
-            f"2. Extract to C:\\ffmpeg\n"
-            f"3. Add C:\\ffmpeg\\bin to PATH\n"
-            f"4. Restart command prompt\n\n"
-            f"**Or use Chocolatey**:\n"
-            f"`choco install ffmpeg`\n\n"
-            f"**Test installation**: `ffmpeg -version`"
+        error_msg = (
+            f"⚠️ **FFmpeg Not Available**\n\n"
+            f"**Status**: {ffmpeg_msg}\n"
+            f"**Platform**: {deployment_info['platform']}\n\n"
         )
+        
+        if deployment_info['platform'] != 'local':
+            error_msg += (
+                f"**Cloud Deployment Issue**:\n"
+                f"FFmpeg is not installed in the deployment environment.\n\n"
+                f"**Solutions**:\n"
+                f"• Check if `nixpacks.toml` is properly configured\n"
+                f"• Verify Railway build logs for FFmpeg installation\n"
+                f"• Consider using Docker deployment with Dockerfile\n\n"
+                f"**Current deployment**: {deployment_info['service']}-{deployment_info['deployment_id']}"
+            )
+        else:
+            error_msg += (
+                f"**Local Installation**:\n"
+                f"1. Download from: https://ffmpeg.org/download.html\n"
+                f"2. Extract to C:\\ffmpeg\n"
+                f"3. Add C:\\ffmpeg\\bin to PATH\n"
+                f"4. Restart command prompt\n\n"
+                f"**Or use Chocolatey**: `choco install ffmpeg`\n\n"
+                f"**Test installation**: `ffmpeg -version`"
+            )
+        
+        await message.reply_text(error_msg)
         return
     
     await message.reply_text(
-        "🎬 **Professional Video Trimmer Bot**\n\n"
-        "📁 **File Size Limit**: Up to 2GB\n"
-        "⚡ **Features**: Progress tracking, fast processing\n"
-        f"✅ **FFmpeg**: {ffmpeg_msg}\n\n"
-        "Send me a video file and I'll help you trim it!\n"
-        "Supported formats: MP4, AVI, MOV, MKV, etc."
+        f"🎬 **Professional Video Trimmer Bot**\n\n"
+        f"📁 **File Size Limit**: Up to 2GB\n"
+        f"⚡ **Features**: Progress tracking, fast processing\n"
+        f"✅ **FFmpeg**: {ffmpeg_msg}\n"
+        f"🚀 **Platform**: {deployment_info['platform']}\n\n"
+        f"Send me a video file and I'll help you trim it!\n"
+        f"Supported formats: MP4, AVI, MOV, MKV, etc."
     )
 
 @app.on_message(filters.command("cancel"))
@@ -111,11 +139,30 @@ async def cancel_command(client: Client, message: Message):
     
     await message.reply_text("❌ Operation cancelled. Send a video to start again.")
 
-@app.on_message(filters.video)
+@app.on_message(filters.video | filters.document)
 async def handle_video(client: Client, message: Message):
-    """Handle video messages"""
+    """Handle video messages and video documents"""
     user_id = message.from_user.id
-    video = message.video
+    
+    # Check if it's a video or video document
+    if message.video:
+        video = message.video
+        file_name = video.file_name or "video.mp4"
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith('video/'):
+        video = message.document
+        file_name = video.file_name or "video.mp4"
+    elif message.document and message.document.file_name and any(ext in message.document.file_name.lower() for ext in ['.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv']):
+        video = message.document
+        file_name = video.file_name
+    else:
+        await message.reply_text(
+            "❌ **Not a video file**\n\n"
+            "Please send a video file with one of these formats:\n"
+            "• MP4, AVI, MOV, MKV\n"
+            "• WEBM, FLV, WMV\n\n"
+            "Make sure the file is sent as a video or document."
+        )
+        return
     
     # Check file size
     if video.file_size > MAX_FILE_SIZE_BYTES:
@@ -130,20 +177,23 @@ async def handle_video(client: Client, message: Message):
     VIDEO_DATA[user_id] = {
         'message_id': message.id,
         'file_id': video.file_id,
-        'duration': video.duration,
+        'duration': getattr(video, 'duration', None),
         'file_size': video.file_size,
-        'file_name': video.file_name or "video.mp4"
+        'file_name': file_name,
+        'is_document': message.document is not None
     }
     
     USER_STATES[user_id] = 'waiting_for_start_time'
     
     # Format file info
     size_mb = video.file_size / (1024 * 1024)
-    duration_text = f"⏱️ **Duration**: {video.duration}s" if video.duration else "⏱️ **Duration**: Unknown"
+    duration_text = f"⏱️ **Duration**: {video.duration}s" if getattr(video, 'duration', None) else "⏱️ **Duration**: Unknown"
     size_text = f"📦 **Size**: {size_mb:.1f}MB"
+    file_type = "📄 Document" if message.document else "🎬 Video"
     
     await message.reply_text(
-        f"✅ **Video Received!**\n\n"
+        f"✅ **Video Received!** ({file_type})\n\n"
+        f"📁 **File**: {file_name}\n"
         f"{duration_text}\n"
         f"{size_text}\n\n"
         f"📝 **Step 1/2**: Send the **start time**\n"
@@ -262,16 +312,22 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
         
         # Create temporary files with better naming
         temp_dir = tempfile.mkdtemp(prefix="video_trimmer_")
-        input_path = os.path.join(temp_dir, f"input_{user_id}.mp4")
-        output_path = os.path.join(temp_dir, f"output_{user_id}.mp4")
+        
+        # Use original file extension
+        file_name = video_data['file_name']
+        file_ext = os.path.splitext(file_name)[1] if file_name else '.mp4'
+        
+        input_path = os.path.join(temp_dir, f"input_{user_id}{file_ext}")
+        output_path = os.path.join(temp_dir, f"output_{user_id}{file_ext}")
         
         # Download video with progress
-        progress_msg = await message.reply_text("📥 Downloading video... 0%")
+        file_type = "document" if video_data['is_document'] else "video"
+        progress_msg = await message.reply_text(f"📥 Downloading {file_type}... 0%")
         
         await original_msg.download(
             file_name=input_path,
             progress=progress_callback,
-            progress_args=(progress_msg, "📥 Downloading")
+            progress_args=(progress_msg, f"📥 Downloading {file_type}")
         )
         
         # Verify downloaded file
@@ -326,12 +382,13 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
         
         await progress_msg.edit("📤 Uploading trimmed video... 0%")
         
-        # Upload trimmed video with progress
+        # Upload trimmed video with progress - always as video, not document
         await client.send_video(
             chat_id=message.chat.id,
             video=output_path,
             caption=(
                 f"✅ **Video Trimmed Successfully!**\n\n"
+                f"📁 **Original**: {video_data['file_name']}\n"
                 f"⏱️ **Trimmed**: {start_time}s → {end_time}s\n"
                 f"📏 **Duration**: {duration}s\n"
                 f"📦 **Size**: {output_size_mb:.1f}MB\n\n"
@@ -421,8 +478,14 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
             del VIDEO_DATA[user_id]
 
 if __name__ == "__main__":
+    deployment_info = get_deployment_info()
     logger.info("Starting Professional Video Trimmer Bot...")
     logger.info(f"File size limit: {MAX_FILE_SIZE_MB}MB")
+    logger.info(f"Platform: {deployment_info['platform']}")
+    
+    if deployment_info['platform'] != 'local':
+        logger.info(f"Service: {deployment_info['service']}")
+        logger.info(f"Deployment ID: {deployment_info['deployment_id']}")
     
     # Check FFmpeg on startup
     ffmpeg_ok, ffmpeg_msg = check_ffmpeg()
@@ -430,6 +493,10 @@ if __name__ == "__main__":
         logger.info(f"✅ {ffmpeg_msg}")
     else:
         logger.warning(f"⚠️ {ffmpeg_msg}")
-        logger.warning("Bot will still start, but video processing will fail without FFmpeg")
+        if deployment_info['platform'] != 'local':
+            logger.error("🚨 FFmpeg missing in cloud deployment - video processing will fail!")
+            logger.error("💡 Solution: Ensure nixpacks.toml includes FFmpeg or use Dockerfile")
+        else:
+            logger.warning("Bot will still start, but video processing will fail without FFmpeg")
     
     app.run()
