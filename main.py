@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import asyncio
+import shutil
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
@@ -43,6 +44,22 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+def check_ffmpeg():
+    """Check if FFmpeg is installed and accessible"""
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], 
+                              capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            return True, "FFmpeg found"
+        else:
+            return False, "FFmpeg not working properly"
+    except FileNotFoundError:
+        return False, "FFmpeg not found in PATH"
+    except subprocess.TimeoutExpired:
+        return False, "FFmpeg timeout"
+    except Exception as e:
+        return False, f"FFmpeg check failed: {e}"
+
 async def progress_callback(current, total, message, action):
     """Show download/upload progress"""
     percent = (current / total) * 100
@@ -55,10 +72,29 @@ async def progress_callback(current, total, message, action):
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     """Handle /start command"""
+    # Check FFmpeg availability
+    ffmpeg_ok, ffmpeg_msg = check_ffmpeg()
+    
+    if not ffmpeg_ok:
+        await message.reply_text(
+            f"⚠️ **FFmpeg Not Found**\n\n"
+            f"**Issue**: {ffmpeg_msg}\n\n"
+            f"**Windows Installation**:\n"
+            f"1. Download from: https://ffmpeg.org/download.html\n"
+            f"2. Extract to C:\\ffmpeg\n"
+            f"3. Add C:\\ffmpeg\\bin to PATH\n"
+            f"4. Restart command prompt\n\n"
+            f"**Or use Chocolatey**:\n"
+            f"`choco install ffmpeg`\n\n"
+            f"**Test installation**: `ffmpeg -version`"
+        )
+        return
+    
     await message.reply_text(
         "🎬 **Professional Video Trimmer Bot**\n\n"
         "📁 **File Size Limit**: Up to 2GB\n"
-        "⚡ **Features**: Progress tracking, fast processing\n\n"
+        "⚡ **Features**: Progress tracking, fast processing\n"
+        f"✅ **FFmpeg**: {ffmpeg_msg}\n\n"
         "Send me a video file and I'll help you trim it!\n"
         "Supported formats: MP4, AVI, MOV, MKV, etc."
     )
@@ -202,6 +238,17 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
     progress_msg = None
     
     try:
+        # Check FFmpeg before processing
+        ffmpeg_ok, ffmpeg_msg = check_ffmpeg()
+        if not ffmpeg_ok:
+            await message.reply_text(
+                f"❌ **FFmpeg Error**\n\n"
+                f"**Issue**: {ffmpeg_msg}\n\n"
+                f"Please install FFmpeg and try again.\n"
+                f"Use /start to see installation instructions."
+            )
+            return
+        
         video_data = VIDEO_DATA[user_id]
         start_time = video_data['start_time']
         end_time = video_data['end_time']
@@ -213,14 +260,10 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
             video_data['message_id']
         )
         
-        # Create temporary files
-        input_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
-        input_path = input_file.name
-        input_file.close()
-        
-        output_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
-        output_path = output_file.name
-        output_file.close()
+        # Create temporary files with better naming
+        temp_dir = tempfile.mkdtemp(prefix="video_trimmer_")
+        input_path = os.path.join(temp_dir, f"input_{user_id}.mp4")
+        output_path = os.path.join(temp_dir, f"output_{user_id}.mp4")
         
         # Download video with progress
         progress_msg = await message.reply_text("📥 Downloading video... 0%")
@@ -231,9 +274,13 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
             progress_args=(progress_msg, "📥 Downloading")
         )
         
+        # Verify downloaded file
+        if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
+            raise Exception("Downloaded file is empty or missing")
+        
         await progress_msg.edit("✂️ Trimming video...")
         
-        # Trim video using ffmpeg
+        # Build FFmpeg command with better error handling
         cmd = [
             'ffmpeg',
             '-i', input_path,
@@ -241,23 +288,40 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
             '-t', str(duration),
             '-c', 'copy',
             '-avoid_negative_ts', 'make_zero',
-            output_path,
-            '-y'
+            '-y',  # Overwrite output file
+            output_path
         ]
         
         logger.info(f"Running FFmpeg: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Run FFmpeg with timeout
+        result = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True, 
+            timeout=300  # 5 minute timeout
+        )
         
         if result.returncode != 0:
-            logger.error(f"FFmpeg error: {result.stderr}")
-            raise Exception(f"FFmpeg failed: {result.stderr}")
+            logger.error(f"FFmpeg stderr: {result.stderr}")
+            # Try to identify specific error
+            if "Invalid data found" in result.stderr:
+                raise Exception("Invalid video format or corrupted file")
+            elif "No such file" in result.stderr:
+                raise Exception("Input file not found")
+            elif "Permission denied" in result.stderr:
+                raise Exception("Permission denied - check file permissions")
+            else:
+                raise Exception(f"FFmpeg failed: {result.stderr}")
         
         # Check output file
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise Exception("Output file was not created or is empty")
+        if not os.path.exists(output_path):
+            raise Exception("Output file was not created")
         
-        # Get output file size
         output_size = os.path.getsize(output_path)
+        if output_size == 0:
+            raise Exception("Output file is empty")
+        
         output_size_mb = output_size / (1024 * 1024)
         
         await progress_msg.edit("📤 Uploading trimmed video... 0%")
@@ -268,7 +332,7 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
             video=output_path,
             caption=(
                 f"✅ **Video Trimmed Successfully!**\n\n"
-                f"⏱️ **Original**: {start_time}s → {end_time}s\n"
+                f"⏱️ **Trimmed**: {start_time}s → {end_time}s\n"
                 f"📏 **Duration**: {duration}s\n"
                 f"📦 **Size**: {output_size_mb:.1f}MB\n\n"
                 f"Send another video to trim more!"
@@ -279,18 +343,51 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
         
         await progress_msg.delete()
         
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg timeout")
+        await message.reply_text(
+            "❌ **Processing Timeout**\n\n"
+            "The video is taking too long to process.\n"
+            "Try with a shorter clip or smaller file."
+        )
+        
     except Exception as e:
         logger.error(f"Error trimming video: {e}")
-        error_msg = (
-            f"❌ **Processing Error**\n\n"
-            f"**Issue**: {str(e)}\n\n"
-            f"**Common causes**:\n"
-            f"• FFmpeg not installed\n"
-            f"• Invalid time range\n"
-            f"• Corrupted video file\n"
-            f"• Insufficient disk space\n\n"
-            f"Try again with different settings."
-        )
+        
+        # Provide specific error messages
+        if "No such file or directory: 'ffmpeg'" in str(e):
+            error_msg = (
+                "❌ **FFmpeg Not Found**\n\n"
+                "Please install FFmpeg:\n"
+                "• Windows: Download from ffmpeg.org\n"
+                "• Or use: `choco install ffmpeg`\n"
+                "• Add to PATH and restart\n\n"
+                "Use /start for detailed instructions."
+            )
+        elif "Invalid video format" in str(e):
+            error_msg = (
+                "❌ **Invalid Video Format**\n\n"
+                "The video file appears to be corrupted or in an unsupported format.\n"
+                "Try with a different video file."
+            )
+        elif "Permission denied" in str(e):
+            error_msg = (
+                "❌ **Permission Error**\n\n"
+                "Cannot access temporary files.\n"
+                "Please check disk permissions and available space."
+            )
+        else:
+            error_msg = (
+                f"❌ **Processing Error**\n\n"
+                f"**Issue**: {str(e)}\n\n"
+                f"**Common solutions**:\n"
+                f"• Check if FFmpeg is installed\n"
+                f"• Verify time range is valid\n"
+                f"• Ensure sufficient disk space\n"
+                f"• Try with a different video\n\n"
+                f"Use /start to check FFmpeg status."
+            )
+        
         await message.reply_text(error_msg)
         
         if progress_msg:
@@ -300,14 +397,22 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
                 pass
     
     finally:
-        # Cleanup temporary files
-        for file_path in [input_path, output_path]:
-            if file_path and os.path.exists(file_path):
+        # Cleanup temporary files and directory
+        try:
+            if input_path and os.path.exists(input_path):
+                os.unlink(input_path)
+                logger.debug(f"Cleaned up: {input_path}")
+            if output_path and os.path.exists(output_path):
+                os.unlink(output_path)
+                logger.debug(f"Cleaned up: {output_path}")
+            # Remove temp directory if empty
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
                 try:
-                    os.unlink(file_path)
-                    logger.debug(f"Cleaned up: {file_path}")
-                except Exception as e:
-                    logger.warning(f"Cleanup failed for {file_path}: {e}")
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass  # Directory not empty
+        except Exception as e:
+            logger.warning(f"Cleanup failed: {e}")
         
         # Reset user state
         if user_id in USER_STATES:
@@ -318,4 +423,13 @@ async def trim_and_send_video(client: Client, message: Message, user_id: int):
 if __name__ == "__main__":
     logger.info("Starting Professional Video Trimmer Bot...")
     logger.info(f"File size limit: {MAX_FILE_SIZE_MB}MB")
+    
+    # Check FFmpeg on startup
+    ffmpeg_ok, ffmpeg_msg = check_ffmpeg()
+    if ffmpeg_ok:
+        logger.info(f"✅ {ffmpeg_msg}")
+    else:
+        logger.warning(f"⚠️ {ffmpeg_msg}")
+        logger.warning("Bot will still start, but video processing will fail without FFmpeg")
+    
     app.run()
